@@ -1,67 +1,81 @@
-from mininet.net import Mininet
+"""Mininet topology for the TrafficPriority shared-bottleneck testbed."""
+
+import os
+
 from mininet.cli import CLI
-from mininet.node import OVSSwitch, RemoteController
 from mininet.link import TCLink
 from mininet.log import setLogLevel
-import os  # Import modul os
+from mininet.net import Mininet
+from mininet.node import OVSSwitch, RemoteController
+
+
+CONTROLLER_HOST = "127.0.0.1"
+CONTROLLER_PORT = 6653
+ACCESS_LINK_MBPS = 10
+BOTTLENECK_LINK_MBPS = 5
+
 
 def create_topology():
-    """
-    Creates a simple Mininet topology with two hosts and one Open vSwitch.
-    """
-    # Running Open vSwitch service
+    """Create two traffic sources and one receiver behind a shared bottleneck."""
     print("Starting Open vSwitch service...")
-    os.system('service openvswitch-switch start')
+    if os.system("service openvswitch-switch start") != 0:
+        raise RuntimeError("Open vSwitch failed to start")
 
-    os.system('sleep 3')
-
-    # Create the Mininet instance
     net = Mininet(
-        controller=RemoteController,
+        controller=None,
         switch=OVSSwitch,
-        link=TCLink
+        link=TCLink,
+        autoSetMacs=True,
     )
 
-    # Add the controller
-    print("Adding controller...")
-    c1 = net.addController('c1', controller=RemoteController, ip='127.0.0.1', port=6653)
+    print("Adding controller, hosts, and OpenFlow 1.3 switches...")
+    net.addController(
+        "c1",
+        controller=RemoteController,
+        ip=CONTROLLER_HOST,
+        port=CONTROLLER_PORT,
+    )
 
-    print("Adding hosts and switches...")
-    # Add the managed hosts and switch (use OpenFlow13 for compatibility with Ryu v1.3)
-    h1 = net.addHost('h1', ip='10.0.0.1')
-    h2 = net.addHost('h2', ip='10.0.0.2')
-    s1 = net.addSwitch('s1', protocols='OpenFlow13')
+    h1 = net.addHost("h1", ip="10.0.0.1/24")
+    h2 = net.addHost("h2", ip="10.0.0.2/24")
+    h3 = net.addHost("h3", ip="10.0.0.3/24")
+    h4 = net.addHost("h4", ip="10.0.0.4/24")
+    s1 = net.addSwitch("s1", protocols="OpenFlow13", failMode="secure")
+    s2 = net.addSwitch("s2", protocols="OpenFlow13", failMode="secure")
 
-    # Add the unmanaged hosts and switch (use OpenFlow13)
-    h3 = net.addHost('h3', ip='10.0.0.3')
-    h4 = net.addHost('h4', ip='10.0.0.4')
-    s2 = net.addSwitch('s2', protocols='OpenFlow13')
+    print("Creating access links and the shared 5 Mbps bottleneck...")
+    net.addLink(h1, s1, bw=ACCESS_LINK_MBPS, delay="1ms")
+    net.addLink(h2, s1, bw=ACCESS_LINK_MBPS, delay="1ms")
+    net.addLink(
+        s1,
+        s2,
+        bw=BOTTLENECK_LINK_MBPS,
+        delay="5ms",
+        max_queue_size=100,
+        use_htb=True,
+    )
+    net.addLink(h3, s2, bw=ACCESS_LINK_MBPS, delay="1ms")
+    net.addLink(h4, s2, bw=ACCESS_LINK_MBPS, delay="1ms")
 
-    # Create links between hosts and switches
-    # print("Creating links...")
-    # net.addLink(h1, s1)
-    # net.addLink(h2, s1)
-    print("Creating links...")
-    # Managed network links
-    net.addLink(h1, s1, cls=TCLink, bw=10, delay='1ms')
-    net.addLink(h2, s1, cls=TCLink, bw=10, delay='1ms')
+    try:
+        print("Starting network...")
+        net.start()
+        if not net.waitConnected(timeout=10):
+            raise RuntimeError(
+                "Switches did not connect to Ryu at "
+                f"{CONTROLLER_HOST}:{CONTROLLER_PORT}"
+            )
 
-    # Unmanaged network links
-    net.addLink(h3, s2, cls=TCLink, bw=10, delay='1ms')
-    net.addLink(h4, s2, cls=TCLink, bw=10, delay='1ms')
+        print("Network ready; no startup traffic has been generated.")
+        print("Expected bottleneck: s1-eth3 <-> s2-eth1 at 5 Mbps.")
+        print("Use 'links' and 'sh ovs-ofctl -O OpenFlow13 show s1' to verify ports.")
+        print("Use 'h1 ping -c 1 h3' and 'h2 ping -c 1 h3' to verify paths.")
+        CLI(net)
+    finally:
+        print("Stopping network...")
+        net.stop()
 
-    print("Starting network...")
-    net.start()
 
-    print("Testing network connectivity...")
-    net.pingAll()
-
-    print("Running CLI...")
-    CLI(net)
-
-    print("Stopping network...")
-    net.stop()
-
-if __name__ == '__main__':
-    setLogLevel('info')
+if __name__ == "__main__":
+    setLogLevel("info")
     create_topology()

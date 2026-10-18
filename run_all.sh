@@ -1,10 +1,17 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Start Ryu in the background and bind to TCP port 6653 for Mininet RemoteController
+set -euo pipefail
+
 echo "Starting Ryu controller on 0.0.0.0:6653..."
 ryu-manager --ofp-tcp-listen 6653 /app/priority_ryu_controller.py &
 RYU_PID=$!
-echo "Ryu PID=$RYU_PID"
 
-# Run the Mininet topology script
+cleanup() {
+    kill "${RYU_PID}" 2>/dev/null || true
+    wait "${RYU_PID}" 2>/dev/null || true
+}
+
+trap cleanup EXIT INT TERM
+
+echo "Ryu PID=${RYU_PID}"
 python3 /app/ryu_topo.py

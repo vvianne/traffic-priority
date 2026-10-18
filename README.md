@@ -1,89 +1,133 @@
-# Traffic Prioritization with Ryu in Mininet
+# Traffic Prioritization with Ryu and Mininet
 
-This project demonstrates a Software-Defined Networking (SDN) implementation to prioritize network traffic based on application type. Using the Ryu controller and the Mininet network emulator, the system differentiates between high-priority video traffic and low-priority file transfers, ensuring a better Quality of Service (QoS) for real-time video streams.
+TrafficPriority is an SDN testbed built with Ryu, OpenFlow 1.3, Open vSwitch, and Mininet. Two traffic sources share one 5 Mbps inter-switch bottleneck on their path to a receiver.
 
----
+> **Current status:** the shared-bottleneck topology, controller connectivity, and contextual TCP/5001 and TCP/5002 classification are implemented. Bandwidth prioritization is not implemented yet: OpenFlow rule priority selects which matching rule wins; it does not schedule packets or reserve bandwidth. Actual QoS requires Open vSwitch queues, which are planned in later tickets.
 
-### Key Features
+See the [v1 baseline report](docs/baseline-v1.md) for the behavior before the topology correction. The remaining work is described in [the v2 roadmap](TRAFFICPRIORITY_V2_ROADMAP.md).
 
-* **Traffic Classification**: The Ryu controller inspects TCP packet headers to identify traffic based on destination port numbers.
-* **Prioritization**: OpenFlow rules are dynamically installed on the virtual switch (`s1`) to give a higher priority to video traffic (Port 5001) over file transfer traffic (Port 5002).
-* **Emulated Environment**: The entire network is simulated within a single isolated **Docker container**, ensuring a consistent and reproducible environment for testing.
+## Topology
 
----
+```text
+h1 (10.0.0.1) --10 Mbps--\
+                           s1 == 5 Mbps == s2 --10 Mbps-- h3 (10.0.0.3)
+h2 (10.0.0.2) --10 Mbps--/                 \\--10 Mbps-- h4 (10.0.0.4)
+```
 
-### Project Structure
+`h1` and `h2` are the traffic sources, and `h3` is the primary receiver. Both source-to-receiver paths cross `s1-eth3 <-> s2-eth1`, the shared 5 Mbps bottleneck. The 10 Mbps access links are intentionally faster so they do not become the limiting path.
 
-* `Dockerfile`: Defines the Docker image, including all necessary dependencies like Ryu, Mininet, and Python libraries.
-* `priority_ryu_controller.py`: The core of the project. This is the Ryu controller application that handles `PacketIn` events, learns host MAC addresses, and installs flow rules with different priorities.
-* `ryu_topo.py`: The Mininet script that builds the network topology (`h1 -- s1 -- h2`) and starts the Open vSwitch (OVS) service.
-* `start_project.sh`: A shell script to automate the entire process, including building the Docker image and starting the container.
+Both switches:
 
----
+- use OpenFlow 1.3;
+- run in secure fail mode; and
+- must connect to the Ryu controller at `127.0.0.1:6653` before the CLI opens.
 
-### Getting Started
+Startup does not run `pingAll()` or generate other test traffic. This leaves only the table-miss rules in place so first-packet behavior can be inspected deliberately.
 
-#### Prerequisites
+## Prerequisites
 
-* **Docker Desktop**: Make sure Docker is installed and running on your system. It is highly recommended to use a Linux environment or WSL2 on Windows.
+- Docker Desktop or Docker Engine with Linux containers
+- A Linux or WSL2 environment capable of running privileged containers
+- Kernel and container permissions sufficient for Open vSwitch and Mininet network namespaces
 
-#### Installation and Execution
+The captured environment uses Docker Desktop with its WSL2 backend on Windows. Other hosts may behave differently; consult the baseline report for the versions tested so far.
 
-1.  **Clone the Repository**:
-    First, clone this repository to your local machine.
+## Build and run
 
-    ```bash
-    git clone [https://github.com/vvianne/TrafficPriority.git](https://github.com/vvianne/TrafficPriority.git)
-    cd TrafficPriority
-    ```
+```bash
+docker build -t traffic-priority .
+docker run --privileged --rm -it traffic-priority
+```
 
-2.  **Build and Run the Docker Container**:
-    Use the provided script to automate the entire process. This command will build the Docker image, run the container with the necessary privileges, and start the Mininet CLI.
+On Linux or WSL2, the helper performs the same steps:
 
-    ```bash
-    chmod +x start_project.sh
-    ./start_project.sh
-    ```
-    The build process may take a few minutes. Once complete, you will see the Mininet CLI prompt (`mininet>`).
+```bash
+chmod +x start_project.sh
+./start_project.sh
+```
 
----
+The container starts Ryu, creates the topology, waits for both switches to connect, prints the expected bottleneck ports, and opens the Mininet CLI.
 
-### Usage and Verification
+## Verify the topology
 
-Once the network is up and running in the Mininet CLI, you can perform the following tests to verify that traffic prioritization is working correctly.
+Before generating traffic, inspect the links, switch ports, controller state, and initial flows:
 
-1.  **Verify Flow Rules**:
-    Check the flow table on the switch (`s1`) to see the default rules installed by Ryu.
-    ```bash
-    mininet> sh ovs-ofctl dump-flows s1
-    ```
-    You will see a single default rule with `priority=0`. After running an `iperf` test, you can run the command again to see the new flow rules with `priority=10` and `priority=20`.
+```text
+mininet> links
+mininet> sh ovs-ofctl -O OpenFlow13 show s1
+mininet> sh ovs-ofctl -O OpenFlow13 show s2
+mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s1
+mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s2
+```
 
-2.  **Run Priority-Based Traffic Tests**:
-    Start `iperf` servers on `h1` for both types of traffic. Then, run clients on `h2` to generate the traffic.
-    * **Start servers on `h1`**:
-        ```bash
-        mininet> h1 iperf -s -p 5001 &
-        mininet> h1 iperf -s -p 5002 &
-        ```
-    * **Start a high-priority video client on `h2`**:
-        ```bash
-        mininet> h2 iperf -c 10.0.0.1 -p 5001 -t 30
-        ```
-    * **Start a low-priority file transfer client on `h2`**:
-        ```bash
-        mininet> h2 iperf -c 10.0.0.1 -p 5002 -t 30
-        ```
+The port inspection should show `s1-eth3` connected to `s2-eth1`. Before the first packet is sent, each flow table should contain only its priority-0 controller rule.
 
-3.  **Observe the Logs**:
-    In the terminal where your Ryu controller is running, you will see log messages confirming that the controller has identified the traffic and installed the appropriate flow rules with `priority=20` for video and `priority=10` for file transfer.
+Verify both source-to-receiver paths and their reverse directions explicitly:
 
----
+```text
+mininet> h1 ping -c 1 h3
+mininet> h2 ping -c 1 h3
+mininet> h3 ping -c 1 h1
+mininet> h3 ping -c 1 h2
+```
 
-### Further Exploration
+Inspect the traffic-control class applied to the shared link:
 
-This project can be extended to include more advanced features such as:
+```text
+mininet> sh tc class show dev s1-eth3
+```
 
-* **Quality of Service (QoS)**: Implement specific rate-limiting or queueing disciplines for different traffic types.
-* **Network Resilience**: Add redundant links to the topology to test failover and dynamic routing capabilities.
-* **Visual Monitoring**: Use Ryu's REST API to build a simple dashboard to monitor network statistics and traffic flows in real-time.
+It should report `rate 5Mbit ceil 5Mbit`. An indicative single-flow probe can then be run with:
+
+```text
+mininet> h3 iperf -s -p 5001 > /tmp/iperf-server.log 2>&1 &
+mininet> h1 iperf -c 10.0.0.3 -p 5001 -t 5
+```
+
+Docker scheduling, short test duration, and Mininet resource-limit warnings can make a single `iperf` result noisy, so use the traffic-control state as the authoritative configured rate. This probe does not demonstrate QoS. A valid QoS experiment must run both traffic classes concurrently and compare queue-enabled and queue-disabled conditions.
+
+## Verify traffic classification
+
+The high-priority lab class is TCP/5001 and the best-effort lab class is TCP/5002. First generate ordinary ICMP traffic to prove learned forwarding does not hide later classification, then run both TCP flows:
+
+```text
+mininet> h1 ping -c 1 h3
+mininet> h3 iperf -s -p 5001 > /tmp/iperf-server.log 2>&1 &
+mininet> h3 iperf -s -p 5002 > /tmp/iperf-best-effort.log 2>&1 &
+mininet> h1 iperf -c 10.0.0.3 -p 5001 -t 3
+mininet> h2 iperf -c 10.0.0.3 -p 5002 -t 3
+mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s1
+mininet> sh ovs-ofctl -O OpenFlow13 dump-flows s2
+```
+
+Ryu should log each classification once per switch. The flow dumps should contain priority-100 TCP/5001 and priority-90 TCP/5002 rules matching the ingress port, source and destination MAC addresses, source and destination IPv4 addresses, TCP source port, and TCP destination port. On the documented topology, forward actions are `output:3` on `s1` and `output:2` on `s2`; a flood action is never stored as a class-specific rule.
+
+The classification policy has non-privileged unit tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+### Fallback behavior
+
+- ARP and non-TCP packets use learned forwarding with an EtherType- or IP-protocol-specific match.
+- TCP ports without a configured class use a priority-10 contextual rule containing their directed IP and transport endpoints.
+- An unknown destination is flooded for the current packet only. No flood output is installed in the flow table.
+- LLDP is ignored by the application.
+- MAC learning is isolated by datapath, so the same MAC can map to different ports on different switches.
+- OpenFlow buffer ID `0` is treated as valid. The `OFP_NO_BUFFER` sentinel causes the packet bytes to be included in `PacketOut`.
+
+## Current forwarding behavior
+
+The Ryu application provides table-miss handling, per-datapath MAC learning, protocol-specific learned forwarding, explicit TCP/5001 and TCP/5002 classes, and contextual fallback forwarding. Learned ARP, ICMP, or unrelated TCP rules cannot capture either classified traffic flow.
+
+## Known limitations
+
+- No OVS QoS or Queue records are configured yet.
+- Flow rule priority is not packet scheduling priority.
+- Docker dependencies are not fully pinned, so a future rebuild may resolve different package versions.
+- Privileged Mininet execution depends on the host kernel and Docker environment.
+
+## v2 objective
+
+TrafficPriority v2 will map traffic classes to real OVS queues, run simultaneous without-QoS and with-QoS experiments, and publish raw measurements plus reproducible plots. Until those stages are complete, this repository should be described as an SDN shared-bottleneck testbed rather than a working QoS system.

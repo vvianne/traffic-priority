@@ -1,9 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Build the Docker image
-echo "Building Docker image..."
-docker build -t ryu-mininet-env .
+set -euo pipefail
 
-# Run the Docker container
-echo "Running the container..."
-docker run --privileged -it ryu-mininet-env
+IMAGE_NAME="traffic-priority"
+
+echo "Building Docker image ${IMAGE_NAME}..."
+docker build -t "${IMAGE_NAME}" .
+
+echo "Running the privileged Mininet container..."
+docker run --privileged --rm -it "${IMAGE_NAME}"
