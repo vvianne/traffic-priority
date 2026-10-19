@@ -1,6 +1,9 @@
 """Mininet topology for the TrafficPriority shared-bottleneck testbed."""
 
+import argparse
 import os
+from pathlib import Path
+import subprocess
 
 from mininet.cli import CLI
 from mininet.link import TCLink
@@ -13,14 +16,27 @@ CONTROLLER_HOST = "127.0.0.1"
 CONTROLLER_PORT = 6653
 ACCESS_LINK_MBPS = 10
 BOTTLENECK_LINK_MBPS = 5
+QOS_EGRESS_PORT = "s1-eth3"
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent / "scripts"
 
 
-def create_topology():
-    """Create two traffic sources and one receiver behind a shared bottleneck."""
+def qos_script(name, check=True):
+    """Run a repository-owned QoS lifecycle script for the bottleneck port."""
+    return subprocess.run(
+        [str(SCRIPT_DIRECTORY / name), QOS_EGRESS_PORT, "s1"],
+        check=check,
+    )
+
+
+def ensure_openvswitch():
+    """Start the Open vSwitch service required by Mininet."""
     print("Starting Open vSwitch service...")
     if os.system("service openvswitch-switch start") != 0:
         raise RuntimeError("Open vSwitch failed to start")
 
+
+def build_network(qos_enabled=False):
+    """Build, but do not start, the shared-bottleneck network."""
     net = Mininet(
         controller=None,
         switch=OVSSwitch,
@@ -46,36 +62,71 @@ def create_topology():
     print("Creating access links and the shared 5 Mbps bottleneck...")
     net.addLink(h1, s1, bw=ACCESS_LINK_MBPS, delay="1ms")
     net.addLink(h2, s1, bw=ACCESS_LINK_MBPS, delay="1ms")
-    net.addLink(
-        s1,
-        s2,
-        bw=BOTTLENECK_LINK_MBPS,
-        delay="5ms",
-        max_queue_size=100,
-        use_htb=True,
-    )
+    if qos_enabled:
+        # OVS must own the root qdisc when it installs linux-htb queues.
+        # Applying TCLink shaping here as well would leave valid OVSDB records
+        # that cannot materialize as kernel queue classes.
+        net.addLink(s1, s2)
+    else:
+        net.addLink(
+            s1,
+            s2,
+            bw=BOTTLENECK_LINK_MBPS,
+            max_queue_size=100,
+            use_htb=True,
+        )
     net.addLink(h3, s2, bw=ACCESS_LINK_MBPS, delay="1ms")
     net.addLink(h4, s2, bw=ACCESS_LINK_MBPS, delay="1ms")
+    return net
+
+
+def start_network(net, qos_enabled=False):
+    """Start the network, wait for Ryu, and apply the selected policy."""
+    print("Starting network...")
+    net.start()
+    if not net.waitConnected(timeout=10):
+        raise RuntimeError(
+            "Switches did not connect to Ryu at "
+            f"{CONTROLLER_HOST}:{CONTROLLER_PORT}"
+        )
+
+    if qos_enabled:
+        qos_script("setup_qos.sh")
+
+
+def stop_network(net, qos_enabled=False):
+    """Remove repository-owned QoS state and stop the network."""
+    if qos_enabled:
+        qos_script("cleanup_qos.sh", check=False)
+    print("Stopping network...")
+    net.stop()
+
+
+def create_topology(qos_enabled=False):
+    """Create two traffic sources and one receiver behind a shared bottleneck."""
+    ensure_openvswitch()
+    net = build_network(qos_enabled=qos_enabled)
 
     try:
-        print("Starting network...")
-        net.start()
-        if not net.waitConnected(timeout=10):
-            raise RuntimeError(
-                "Switches did not connect to Ryu at "
-                f"{CONTROLLER_HOST}:{CONTROLLER_PORT}"
-            )
+        start_network(net, qos_enabled=qos_enabled)
 
         print("Network ready; no startup traffic has been generated.")
         print("Expected bottleneck: s1-eth3 <-> s2-eth1 at 5 Mbps.")
+        print("QoS mode: {}.".format("enabled" if qos_enabled else "disabled"))
         print("Use 'links' and 'sh ovs-ofctl -O OpenFlow13 show s1' to verify ports.")
         print("Use 'h1 ping -c 1 h3' and 'h2 ping -c 1 h3' to verify paths.")
         CLI(net)
     finally:
-        print("Stopping network...")
-        net.stop()
+        stop_network(net, qos_enabled=qos_enabled)
 
 
 if __name__ == "__main__":
+    argument_parser = argparse.ArgumentParser()
+    argument_parser.add_argument(
+        "--qos",
+        action="store_true",
+        help="Attach the OVS HTB queue policy to the bottleneck egress.",
+    )
+    arguments = argument_parser.parse_args()
     setLogLevel("info")
-    create_topology()
+    create_topology(qos_enabled=arguments.qos)

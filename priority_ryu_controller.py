@@ -1,5 +1,7 @@
 """Ryu controller for contextual forwarding and traffic classification."""
 
+import os
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -8,10 +10,19 @@ from ryu.lib.packet import ether_types, ethernet, ipv4, packet, tcp
 from ryu.ofproto import ofproto_v1_3
 
 from openflow_utils import has_usable_buffer_id
-from traffic_policy import classify_tcp_destination_port
+from traffic_policy import DEFAULT_QUEUE_ID, classify_tcp_destination_port
 
 
 FORWARDING_PRIORITY = 10
+DEFAULT_QOS_DATAPATH = 1
+DEFAULT_QOS_EGRESS_PORT = 3
+
+
+def environment_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 class PriorityApp(app_manager.RyuApp):
@@ -20,6 +31,37 @@ class PriorityApp(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(PriorityApp, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
+        self.qos_enabled = environment_flag("QOS_ENABLED")
+        self.qos_datapath = int(
+            os.getenv("QOS_DATAPATH", str(DEFAULT_QOS_DATAPATH)),
+            0,
+        )
+        self.qos_egress_port = int(
+            os.getenv("QOS_EGRESS_PORT", str(DEFAULT_QOS_EGRESS_PORT)),
+            0,
+        )
+        self.logger.info(
+            "QoS mode %s for datapath=%s out_port=%s",
+            "enabled" if self.qos_enabled else "disabled",
+            self.qos_datapath,
+            self.qos_egress_port,
+        )
+
+    def output_actions(self, parser, datapath_id, out_port, queue_id):
+        """Set a queue only on the configured bottleneck egress."""
+        actions = []
+        if self.uses_qos_output(datapath_id, out_port):
+            actions.append(parser.OFPActionSetQueue(queue_id))
+        actions.append(parser.OFPActionOutput(out_port))
+        return actions
+
+    def uses_qos_output(self, datapath_id, out_port):
+        """Return whether this output is governed by the OVS queue policy."""
+        return (
+            self.qos_enabled
+            and datapath_id == self.qos_datapath
+            and out_port == self.qos_egress_port
+        )
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -120,13 +162,14 @@ class PriorityApp(app_manager.RyuApp):
             eth.dst,
             ofproto.OFPP_FLOOD,
         )
-        actions = [parser.OFPActionOutput(out_port)]
-
         ip_header = pkt.get_protocol(ipv4.ipv4)
         tcp_header = pkt.get_protocol(tcp.tcp)
         policy = None
         if ip_header is not None and tcp_header is not None:
             policy = classify_tcp_destination_port(tcp_header.dst_port)
+
+        queue_id = policy.queue_id if policy is not None else DEFAULT_QUEUE_ID
+        actions = self.output_actions(parser, dpid, out_port, queue_id)
 
         if out_port != ofproto.OFPP_FLOOD:
             if policy is not None:
@@ -140,11 +183,16 @@ class PriorityApp(app_manager.RyuApp):
                 priority = policy.flow_priority
                 self.logger.info(
                     "Classified %s traffic: datapath=%s in_port=%s "
-                    "out_port=%s match=%s",
+                    "out_port=%s queue_id=%s match=%s",
                     policy.name,
                     dpid,
                     in_port,
                     out_port,
+                    (
+                        queue_id
+                        if self.uses_qos_output(dpid, out_port)
+                        else "not-applied"
+                    ),
                     match,
                 )
             else:
