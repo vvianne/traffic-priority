@@ -20,7 +20,13 @@ from result_analysis import (  # noqa: E402
     render_markdown,
     render_svg,
     validate_rows,
+    sha256_file,
 )
+from extended_analysis import (  # noqa: E402
+    METRICS, SUMMARY_FIELDS as EXTENDED_FIELDS, validate_extended, summarize,
+    render_metric_svg, report_section,
+)
+from latency_probe import LATENCY_FIELDS  # noqa: E402
 
 
 def write_csv(path, fieldnames, rows):
@@ -35,7 +41,7 @@ def write_csv(path, fieldnames, rows):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("raw_csv", type=Path, help="Ticket 6 raw experiment CSV.")
+    parser.add_argument("raw_csv", type=Path, help="Raw v2 or v3 experiment CSV.")
     parser.add_argument(
         "--output-root",
         type=Path,
@@ -55,6 +61,9 @@ def main():
         reader = csv.DictReader(source)
         rows = list(reader)
         validate_rows(rows, reader.fieldnames)
+    extended = bool(set(LATENCY_FIELDS).intersection(reader.fieldnames or ()))
+    if extended:
+        validate_extended(rows)
 
     run_summaries = build_run_summaries(rows)
     aggregates = build_aggregate_summaries(rows, run_summaries)
@@ -71,13 +80,23 @@ def main():
     report_path = analysis_directory / "analysis.md"
     plot_path = plot_directory / f"{raw_path.stem}-throughput-comparison.svg"
 
-    write_csv(per_run_path, RUN_FIELDS, run_summaries)
-    write_csv(summary_path, SUMMARY_FIELDS, aggregates)
-    render_svg(aggregates, plot_path, raw_path.name)
-    report_path.write_text(
-        render_markdown(raw_path, run_summaries, aggregates, notes, plot_path),
-        encoding="utf-8",
-    )
+    provenance = {"raw_source": raw_path.name, "raw_sha256": sha256_file(raw_path)}
+    write_csv(per_run_path, RUN_FIELDS + ("raw_source", "raw_sha256"),
+              [dict(row, **provenance) for row in run_summaries])
+    write_csv(summary_path, SUMMARY_FIELDS + ("raw_source", "raw_sha256"),
+              [dict(row, **provenance) for row in aggregates])
+    render_svg(aggregates, plot_path, raw_path.name + " SHA-256: " + provenance["raw_sha256"])
+    report = render_markdown(raw_path, run_summaries, aggregates, notes, plot_path)
+    if extended:
+        summaries = summarize(rows, raw_path)
+        write_csv(analysis_directory / "extended-summary.csv", EXTENDED_FIELDS, summaries)
+        plot_names = {}
+        for metric in METRICS:
+            filename = f"{raw_path.stem}-{metric}.svg"
+            render_metric_svg(summaries, metric, plot_directory / filename)
+            plot_names[metric] = filename
+        report += report_section(summaries, plot_names)
+    report_path.write_text(report, encoding="utf-8")
 
     print(f"Analyzed {len(run_summaries)} runs from {raw_path}")
     print(f"Per-run summary: {per_run_path}")

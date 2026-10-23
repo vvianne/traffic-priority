@@ -4,6 +4,7 @@ from experiment_metrics import (
     parse_egress_counters,
     parse_flow_counters,
     parse_iperf_csv,
+    parse_iperf_csv_measurement,
     parse_queue_counters,
 )
 
@@ -15,6 +16,58 @@ class ExperimentMetricTests(unittest.TestCase):
             "0.0-10.0,5000000,4000000\n"
         )
         self.assertEqual(4.0, parse_iperf_csv(output))
+
+    def test_validates_receiver_endpoint_and_measurement_window(self):
+        output = (
+            "20261019120000,10.0.0.3,5001,10.0.0.1,40000,3,"
+            "0.0-10.2,5000000,3921568\n"
+        )
+
+        measurement = parse_iperf_csv_measurement(
+            output,
+            expected_addresses=("10.0.0.1", "10.0.0.3"),
+            expected_server_address="10.0.0.3",
+            expected_server_port=5001,
+            expected_duration_s=10,
+        )
+
+        self.assertAlmostEqual(3.921568, measurement.throughput_mbps)
+        self.assertEqual(0.0, measurement.interval_start_s)
+        self.assertEqual(10.2, measurement.interval_end_s)
+        self.assertEqual(5_000_000, measurement.transferred_bytes)
+
+    def test_rejects_wrong_receiver_endpoint(self):
+        output = (
+            "20261019120000,10.0.0.3,5002,10.0.0.1,40000,3,"
+            "0.0-10.0,5000000,4000000\n"
+        )
+        with self.assertRaisesRegex(ValueError, "receiver endpoint"):
+            parse_iperf_csv_measurement(
+                output,
+                expected_addresses=("10.0.0.1", "10.0.0.3"),
+                expected_server_address="10.0.0.3",
+                expected_server_port=5001,
+                expected_duration_s=10,
+            )
+
+    def test_rejects_measurement_outside_configured_window(self):
+        output = (
+            "20261019120000,10.0.0.1,40000,10.0.0.3,5001,3,"
+            "2.0-5.0,5000000,4000000\n"
+        )
+        with self.assertRaisesRegex(ValueError, "configured window"):
+            parse_iperf_csv_measurement(output, expected_duration_s=10)
+
+    def test_rejects_missing_and_ambiguous_results(self):
+        with self.assertRaisesRegex(ValueError, "No valid"):
+            parse_iperf_csv_measurement("server failed")
+
+        output = (
+            "20261019120000,10.0.0.1,40000,10.0.0.3,5001,3,"
+            "0.0-10.0,5000000,4000000\n"
+        ) * 2
+        with self.assertRaisesRegex(ValueError, "Expected one"):
+            parse_iperf_csv_measurement(output)
 
     def test_sums_matching_flow_counters(self):
         output = "\n".join(

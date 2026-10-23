@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 import hashlib
 from html import escape
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from statistics import mean, stdev
 
@@ -36,6 +36,7 @@ RUN_FIELDS = (
     "scenario",
     "load_level",
     "policy",
+    "throughput_source",
     "offered_total_mbps",
     "high_priority_mbps",
     "best_effort_mbps",
@@ -56,6 +57,7 @@ SUMMARY_FIELDS = (
     "scenario",
     "load_level",
     "metric",
+    "measurement_source",
     "sample_count",
     "mean_mbps",
     "stddev_mbps",
@@ -82,6 +84,24 @@ def validate_rows(rows, fieldnames):
         raise ValueError(f"Raw CSV is missing columns: {', '.join(missing)}")
     if not rows:
         raise ValueError("Raw CSV contains no measurements")
+    if "expected_repetitions" in (fieldnames or ()):
+        validate_reproducibility(rows)
+
+    receiver_fields = {
+        "receiver_throughput_mbps",
+        "receiver_measurement_valid",
+        "receiver_measurement_error",
+        "receiver_interval_start_s",
+        "receiver_interval_end_s",
+        "receiver_transferred_bytes",
+    }
+    present_receiver_fields = receiver_fields.intersection(fieldnames or ())
+    if present_receiver_fields and present_receiver_fields != receiver_fields:
+        missing_receiver_fields = sorted(receiver_fields - present_receiver_fields)
+        raise ValueError(
+            "Raw CSV has an incomplete receiver measurement schema: "
+            + ", ".join(missing_receiver_fields)
+        )
 
     grouped = defaultdict(list)
     for row in rows:
@@ -91,6 +111,52 @@ def validate_rows(rows, fieldnames):
             raise ValueError(f"Unknown load level: {row['load_level']}")
         if row["traffic_class"] not in CLASS_ORDER:
             raise ValueError(f"Unknown traffic class: {row['traffic_class']}")
+        if present_receiver_fields:
+            if row["receiver_measurement_valid"].lower() != "true":
+                diagnostic = row.get("receiver_measurement_error") or "no diagnostic"
+                raise ValueError(
+                    f"Run {row['run_id']} has no valid receiver throughput for "
+                    f"{row['traffic_class']}: {diagnostic}"
+                )
+            receiver_value = number(row, "receiver_throughput_mbps")
+            interval_start = number(row, "receiver_interval_start_s")
+            interval_end = number(row, "receiver_interval_end_s")
+            transferred_bytes = number(row, "receiver_transferred_bytes")
+            values = (
+                receiver_value,
+                interval_start,
+                interval_end,
+                transferred_bytes,
+            )
+            if any(value is None or not isfinite(value) for value in values):
+                raise ValueError(
+                    f"Run {row['run_id']} has invalid receiver measurement for "
+                    f"{row['traffic_class']}"
+                )
+            if row.get("protocol", "").upper() == "UDP":
+                try:
+                    jitter = float(row["udp_jitter_ms"])
+                    lost = int(row["udp_lost_datagrams"])
+                    total = int(row["udp_total_datagrams"])
+                    loss = float(row["udp_loss_pct"])
+                    valid = row["udp_metrics_valid"].lower() == "true"
+                except (KeyError, ValueError, TypeError) as error:
+                    raise ValueError("Missing or malformed UDP metrics") from error
+                if (not valid or not isfinite(jitter) or jitter < 0
+                        or not isfinite(loss) or not 0 <= loss <= 100
+                        or total <= 0 or not 0 <= lost <= total
+                        or abs(100 * lost / total - loss) > 0.11):
+                    raise ValueError("Invalid UDP jitter or loss metrics")
+            if (
+                receiver_value < 0
+                or interval_start < 0
+                or interval_end <= interval_start
+                or transferred_bytes < 0
+            ):
+                raise ValueError(
+                    f"Run {row['run_id']} has invalid receiver measurement for "
+                    f"{row['traffic_class']}"
+                )
         grouped[row["run_id"]].append(row)
 
     for run_id, run_rows in grouped.items():
@@ -121,6 +187,66 @@ def validate_rows(rows, fieldnames):
         raise ValueError(f"Raw CSV is missing conditions: {missing_conditions}")
 
 
+def validate_reproducibility(rows):
+    """Reject truncated repetitions and conflicting per-run metadata in v3."""
+    common = (
+        "expected_repetitions", "duration_s", "warmup_s", "scenario_order",
+        "order_seed", "environment_json", "effective_config_json", "config_sha256",
+        "link_capacity_mbps",
+    )
+    required = common + (
+        "repetition", "session_index", "warmup_wall_s", "measurement_end_utc",
+        "egress_window_s", "wall_duration_s", "timestamp_utc", "egress_mbps",
+    )
+    for row in rows:
+        if any(row.get(key) in (None, "") for key in required):
+            raise ValueError("Incomplete reproducibility metadata")
+    if len({tuple(row[key] for key in common) for row in rows}) != 1:
+        raise ValueError("Inconsistent experiment configuration metadata")
+    expected = int(rows[0]["expected_repetitions"])
+    if expected < 1:
+        raise ValueError("Invalid repetition count")
+    seen = defaultdict(set)
+    run_contexts = {}
+    for row in rows:
+        repetition = int(row["repetition"])
+        if not 1 <= repetition <= expected:
+            raise ValueError("Invalid repetition number")
+        condition = (row["scenario"], row["load_level"], row["traffic_class"])
+        if repetition in seen[condition]:
+            raise ValueError("Duplicate repetition in condition")
+        seen[condition].add(repetition)
+        numeric = ("duration_s", "wall_duration_s", "egress_window_s", "link_capacity_mbps")
+        if any(not isfinite(float(row[key])) or float(row[key]) <= 0 for key in numeric):
+            raise ValueError("Invalid measurement timing or capacity")
+        if any(not isfinite(float(row[key])) or float(row[key]) < 0
+               for key in ("warmup_s", "warmup_wall_s", "egress_mbps")):
+            raise ValueError("Invalid warm-up or egress measurement")
+        if datetime.fromisoformat(row["measurement_end_utc"]) <= datetime.fromisoformat(row["timestamp_utc"]):
+            raise ValueError("Measurement timestamps are out of order")
+        context = tuple(row[key] for key in required if key != "repetition") + (repetition,)
+        previous = run_contexts.setdefault(row["run_id"], context)
+        if previous != context:
+            raise ValueError("Inconsistent per-run measurement metadata")
+    if any(values != set(range(1, expected + 1)) for values in seen.values()):
+        raise ValueError("Incomplete repetition matrix")
+
+
+def application_throughput(row):
+    """Use receiver throughput for v3 rows and legacy sender data for v2."""
+    if "receiver_throughput_mbps" in row:
+        value = number(row, "receiver_throughput_mbps")
+        if (
+            row.get("receiver_measurement_valid", "").lower() != "true"
+            or value is None
+        ):
+            raise ValueError(
+                f"Run {row.get('run_id', '<unknown>')} lacks valid receiver throughput"
+            )
+        return value, "receiver_reported"
+    return number(row, "throughput_mbps"), "legacy_sender_reported"
+
+
 def build_run_summaries(rows):
     grouped = defaultdict(list)
     for row in rows:
@@ -130,8 +256,10 @@ def build_run_summaries(rows):
     for run_id, run_rows in grouped.items():
         by_class = {row["traffic_class"]: row for row in run_rows}
         first = run_rows[0]
-        high = number(by_class["high_priority"], "throughput_mbps")
-        best = number(by_class["best_effort"], "throughput_mbps")
+        high, high_source = application_throughput(by_class["high_priority"])
+        best, best_source = application_throughput(by_class["best_effort"])
+        if high_source != best_source:
+            raise ValueError(f"Run {run_id} mixes application throughput sources")
         total = high + best
         capacity = number(first, "link_capacity_mbps")
         egress = number(first, "egress_mbps")
@@ -143,6 +271,7 @@ def build_run_summaries(rows):
                 "scenario": first["scenario"],
                 "load_level": first["load_level"],
                 "policy": first["policy"],
+                "throughput_source": high_source,
                 "offered_total_mbps": sum(
                     number(row, "offered_mbps") for row in run_rows
                 ),
@@ -184,11 +313,14 @@ def build_run_summaries(rows):
     )
 
 
-def metric_summary(scenario, load_level, metric, values, capacity):
+def metric_summary(
+    scenario, load_level, metric, values, capacity, measurement_source
+):
     return {
         "scenario": scenario,
         "load_level": load_level,
         "metric": metric,
+        "measurement_source": measurement_source,
         "sample_count": len(values),
         "mean_mbps": mean(values),
         "stddev_mbps": stdev(values) if len(values) > 1 else 0.0,
@@ -216,9 +348,17 @@ def build_aggregate_summaries(rows, run_summaries):
             if not selected_rows or not selected_runs:
                 continue
             capacity = number(selected_rows[0], "link_capacity_mbps")
+            throughput_sources = {
+                row["throughput_source"] for row in selected_runs
+            }
+            if len(throughput_sources) != 1:
+                raise ValueError(
+                    f"{scenario}/{load_level} mixes application throughput sources"
+                )
+            throughput_source = next(iter(throughput_sources))
             for traffic_class in CLASS_ORDER:
                 values = [
-                    number(row, "throughput_mbps")
+                    application_throughput(row)[0]
                     for row in selected_rows
                     if row["traffic_class"] == traffic_class
                 ]
@@ -229,6 +369,7 @@ def build_aggregate_summaries(rows, run_summaries):
                         traffic_class,
                         values,
                         capacity,
+                        throughput_source,
                     )
                 )
             aggregates.append(
@@ -238,6 +379,7 @@ def build_aggregate_summaries(rows, run_summaries):
                     "total",
                     [row["total_throughput_mbps"] for row in selected_runs],
                     capacity,
+                    throughput_source,
                 )
             )
             aggregates.append(
@@ -247,6 +389,7 @@ def build_aggregate_summaries(rows, run_summaries):
                     "egress_total",
                     [row["egress_mbps"] for row in selected_runs],
                     capacity,
+                    "switch_egress",
                 )
             )
     return aggregates
@@ -265,9 +408,17 @@ def observations(run_summaries, aggregates):
         row for row in run_summaries if not row["total_within_capacity"]
     ]
     if excessive_totals:
+        source_label = (
+            "receiver"
+            if all(
+                row["throughput_source"] == "receiver_reported"
+                for row in run_summaries
+            )
+            else "legacy client"
+        )
         notes.append(
-            f"{len(excessive_totals)} run(s) reported summed client throughput "
-            "more than 5% above link capacity. Treat client throughput as an "
+            f"{len(excessive_totals)} run(s) reported summed {source_label} throughput "
+            "more than 5% above link capacity. Treat application throughput as an "
             "application-side estimate and use egress counters for the capacity check."
         )
 
@@ -380,6 +531,7 @@ def render_svg(aggregates, output_path, source_name):
         if row["metric"] in CLASS_ORDER
     ]
     capacities = [row["link_capacity_mbps"] for row in aggregates]
+    capacity_label = ", ".join(f"{value:g}" for value in sorted(set(capacities)))
     y_max = float(ceil(max(values + capacities + [1.0]) * 1.15))
     width, height = 1200, 650
     top, bottom = 105, 520
@@ -388,6 +540,16 @@ def render_svg(aggregates, output_path, source_name):
     left = 75
     plot_height = bottom - top
     colors = {"high_priority": "#d95f02", "best_effort": "#1b9e77"}
+    application_sources = {
+        row.get("measurement_source", "legacy_sender_reported")
+        for row in aggregates
+        if row["metric"] in CLASS_ORDER
+    }
+    throughput_label = (
+        "receiver-reported throughput"
+        if application_sources == {"receiver_reported"}
+        else "legacy sender-reported throughput"
+    )
 
     def y(value):
         return bottom - value / y_max * plot_height
@@ -402,7 +564,8 @@ def render_svg(aggregates, output_path, source_name):
         '<text x="600" y="32" text-anchor="middle" font-size="22" '
         'font-weight="bold">Traffic-class throughput by load and QoS mode</text>',
         '<text x="600" y="58" text-anchor="middle" font-size="13">'
-        f'Mean throughput; error bars show ±1 SD. Source: {escape(source_name)}</text>',
+        f'Mean {throughput_label}; error bars show ±1 SD. '
+        f'Source: {escape(source_name)}</text>',
         '<rect x="420" y="70" width="16" height="16" fill="#d95f02"/>',
         '<text x="443" y="83" font-size="13">High priority</text>',
         '<rect x="555" y="70" width="16" height="16" fill="#1b9e77"/>',
@@ -483,7 +646,7 @@ def render_svg(aggregates, output_path, source_name):
     parts.extend(
         (
             '<text x="600" y="590" text-anchor="middle" font-size="12">'
-            'Dashed line: configured 5 Mbps bottleneck capacity</text>',
+            f'Dashed line: configured {capacity_label} Mbps bottleneck capacity</text>',
             '<text x="600" y="615" text-anchor="middle" font-size="11">'
             'QoS reallocates constrained capacity; it does not increase link capacity.'
             '</text>',
@@ -496,6 +659,7 @@ def render_svg(aggregates, output_path, source_name):
 def render_markdown(raw_path, run_summaries, aggregates, notes, plot_path):
     generated = datetime.now(timezone.utc).isoformat()
     experiment_ids = sorted({row["experiment_id"] for row in run_summaries})
+    throughput_sources = sorted({row["throughput_source"] for row in run_summaries})
     lines = [
         "# TrafficPriority experiment analysis",
         "",
@@ -504,6 +668,7 @@ def render_markdown(raw_path, run_summaries, aggregates, notes, plot_path):
         f"- Raw SHA-256: `{sha256_file(raw_path)}`",
         f"- Experiment IDs: `{', '.join(experiment_ids)}`",
         f"- Complete runs: `{len(run_summaries)}`",
+        f"- Application throughput source: `{', '.join(throughput_sources)}`",
         f"- Plot: `{Path(plot_path).name}`",
         "",
         f"![Traffic-class throughput comparison](../../plots/{Path(plot_path).name})",

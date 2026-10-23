@@ -1,0 +1,30 @@
+network:
+  access_link_mbps: 10
+  bottleneck_mbps: 5
+  qos_datapath: 1
+  qos_egress_port: 3
+  qos_egress_interface: s1-eth3
+  qos_bridge: s1
+
+traffic_classes:
+  high_priority:
+    protocol: tcp
+    destination_port: 5001
+    flow_priority: 100
+    queue_id: 1
+    min_rate_mbps: 3
+    max_rate_mbps: 5
+  best_effort:
+    protocol: tcp
+    destination_port: 5002
+    flow_priority: 90
+    queue_id: 0
+    min_rate_mbps: 1
+    max_rate_mbps: 5
+
+adaptive_qos:
+  enabled: false
+  utilization_threshold: 0.8
+  monitoring_interval_seconds: 2
+  hysteresis_margin: 0.1
+  minimum_dwell_seconds: 10
